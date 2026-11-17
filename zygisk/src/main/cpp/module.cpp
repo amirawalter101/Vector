@@ -8,42 +8,139 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
 #include <zygisk.hpp>
 
 #include "ipc_bridge.h"
 
 namespace vector::native::module {
 
-// --- Process UID Constants ---
-// Values used to identify special Android processes to avoid injection.
-// https://android.googlesource.com/platform/system/core/+/master/libcutils/include/private/android_filesystem_config.h
+namespace {
 
-// The range of UIDs used for isolated processes (e.g., web renderers, WebView).
+std::mutex g_art_hooks_mutex;
+std::vector<void *> g_art_hooks;
+bool g_record_art_hooks = false;
+
+bool ReadExact(int fd, void *buf, size_t len) {
+    auto *p = static_cast<uint8_t *>(buf);
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = read(fd, p, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        p += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool WriteExact(int fd, const void *buf, size_t len) {
+    const auto *p = static_cast<const uint8_t *>(buf);
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        p += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+std::string TrimWhitespace(std::string_view sv) {
+    const auto first = sv.find_first_not_of(" \t\r\n");
+    if (first == std::string_view::npos) return {};
+    const auto last = sv.find_last_not_of(" \t\r\n");
+    return std::string(sv.substr(first, last - first + 1));
+}
+
+bool MatchesProcessInFile(const char *path, const std::string &proc_name) {
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+
+    std::string raw_line;
+    while (std::getline(file, raw_line)) {
+        auto comment_pos = raw_line.find('#');
+        if (comment_pos != std::string::npos) {
+            raw_line.erase(comment_pos);
+        }
+        std::string entry = TrimWhitespace(raw_line);
+        if (entry.empty()) continue;
+
+        if (entry == "*" || proc_name == entry) {
+            return true;
+        }
+        // Also match child/service processes of the package (e.g. "com.pkg:remote")
+        if (proc_name.size() > entry.size() &&
+            proc_name.compare(0, entry.size(), entry) == 0 &&
+            proc_name[entry.size()] == ':') {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+void CompanionHandler(int client_fd) {
+    uint32_t len = 0;
+    if (!ReadExact(client_fd, &len, sizeof(len)) || len == 0 || len > 4096) {
+        return;
+    }
+    std::string proc_name(len, '\0');
+    if (!ReadExact(client_fd, proc_name.data(), len)) {
+        return;
+    }
+
+    static constexpr const char *kConfigPaths[] = {
+        "/data/adb/vector/invalidate_inline.txt",
+        "/data/adb/lspd/invalidate_inline.txt",
+        "/data/adb/modules/zygisk_vector/invalidate_inline.txt",
+    };
+
+    uint8_t matched = 0;
+    for (const char *path : kConfigPaths) {
+        if (MatchesProcessInFile(path, proc_name)) {
+            matched = 1;
+            break;
+        }
+    }
+
+    WriteExact(client_fd, &matched, sizeof(matched));
+}
+
+// --- Process UID Constants ---
 constexpr int FIRST_ISOLATED_UID = 99000;
 constexpr int LAST_ISOLATED_UID = 99999;
 
-// The range of UIDs used for application zygotes, which are also not targets.
 constexpr int FIRST_APP_ZYGOTE_ISOLATED_UID = 90000;
 constexpr int LAST_APP_ZYGOTE_ISOLATED_UID = 98999;
 
-// UID for the process responsible for creating shared RELRO files.
 constexpr int SHARED_RELRO_UID = 1037;
-
-// Android uses this to separate users. UID = AppID + UserID * 10000.
 constexpr int PER_USER_RANGE = 100000;
 
-// Defined via CMake generated marcos
 constexpr uid_t kHostPackageUid = INJECTED_PACKAGE_UID;
 const char *const kHostPackageName = INJECTED_PACKAGE_NAME;
 const char *const kManagerPackageName = MANAGER_PACKAGE_NAME;
-constexpr uid_t GID_INET = 3003;  // Android's Internet group ID.
+constexpr uid_t GID_INET = 3003;
 
 enum RuntimeFlags : uint32_t {
-    // Flags defined by NeoZygisk
     LATE_INJECT = 1 << 30,
 };
 
-// A simply ConfigBridge implemnetation holding obfuscation maps in memory
 using obfuscation_map_t = std::map<std::string, std::string>;
 class ConfigImpl : public ConfigBridge {
 public:
@@ -60,19 +157,6 @@ private:
     obfuscation_map_t obfuscation_map_;
 };
 
-/**
- * @class VectorModule
- * @brief The core implementation of the Zygisk module for the Vector framework.
- *
- * This class is the main entry point for Zygisk. It inherits from:
- * - zygisk::ModuleBase:      To receive lifecycle callbacks from the Zygisk loader.
- * - vector::native::Context: To gain the core injection capabilities (DEX loading, ART hooking)
- *                            from the 'native' library.
- *
- * It orchestrates the injection process by deciding which processes to target,
- * using the IPCBridge to fetch the framework from the manager service, and then
- * using the Context base to perform the actual injection.
- */
 class VectorModule : public zygisk::ModuleBase, public vector::native::Context {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override;
@@ -82,33 +166,10 @@ public:
     void postServerSpecialize(const zygisk::ServerSpecializeArgs *args) override;
 
 protected:
-    /**
-     * @brief Provides the concrete implementation for loading the framework DEX.
-     *
-     * This method is a pure virtual in the native::core::Context base class and
-     * must be implemented here.
-     * It uses an InMemoryDexClassLoader to load our framework into the target process.
-     */
     void LoadDex(JNIEnv *env, PreloadedDex &&dex) override;
-
-    /**
-     * @brief Provides the concrete implementation for finding the Java entry
-     * class.
-     *
-     * This method is also a pure virtual in the base class.
-     * It uses the obfuscation map to determine the real entry class name and
-     * finds it in the ClassLoader we created in LoadDex.
-     */
     void SetupEntryClass(JNIEnv *env) override;
 
 private:
-    /**
-     * @brief Encapsulates the logic for telling Zygisk whether to unload our library.
-     *
-     * If we don't inject into a process, we allow Zygisk to dlclose our .so.
-     * Otherwise, we MUST prevent this.
-     * @param unload True to allow unloading, false to prevent it.
-     */
     void SetAllowUnload(bool unload);
 
     zygisk::Api *api_ = nullptr;
@@ -119,9 +180,26 @@ private:
         .inline_hooker =
             [](auto target, auto replace) {
                 void *backup = nullptr;
-                return HookInline(target, replace, &backup) == 0 ? backup : nullptr;
+                if (HookInline(target, replace, &backup) == 0) {
+                    std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
+                    if (g_record_art_hooks &&
+                        std::find(g_art_hooks.begin(), g_art_hooks.end(), target) ==
+                            g_art_hooks.end()) {
+                        g_art_hooks.push_back(target);
+                    }
+                    return backup;
+                }
+                return static_cast<void *>(nullptr);
             },
-        .inline_unhooker = [](auto target) { return UnhookInline(target) == 0; },
+        .inline_unhooker =
+            [](auto target) {
+                bool ok = UnhookInline(target) == 0;
+                if (ok) {
+                    std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
+                    std::erase(g_art_hooks, target);
+                }
+                return ok;
+            },
         .art_symbol_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
         .art_symbol_prefix_resolver =
@@ -130,19 +208,14 @@ private:
         .generated_source_name = "Dobby",
     };
 
-    // State managed within the class instance for each forked process.
     bool should_inject_ = false;
     bool is_manager_app_ = false;
+    bool should_invalidate_inline_hooks_ = false;
 };
-
-// =========================================================================================
-// Implementation of VectorModule
-// =========================================================================================
 
 void VectorModule::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
     LOGV("Loading framework DEX into memory (size: {}).", dex.size());
 
-    // Get the system ClassLoader. This will be the parent of our new loader.
     auto classloader_class = lsplant::JNI_FindClass(env, "java/lang/ClassLoader");
     if (!classloader_class) {
         LOGE("Failed to find java.lang.ClassLoader");
@@ -157,7 +230,6 @@ void VectorModule::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
         return;
     }
 
-    // Create a Java ByteBuffer wrapping our in-memory DEX data.
     auto byte_buffer_class = lsplant::JNI_FindClass(env, "java/nio/ByteBuffer");
     if (!byte_buffer_class) {
         LOGE("Failed to find java.nio.ByteBuffer");
@@ -170,7 +242,6 @@ void VectorModule::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
         return;
     }
 
-    // Create an InMemoryDexClassLoader instance.
     auto in_memory_cl_class = lsplant::JNI_FindClass(env, "dalvik/system/InMemoryDexClassLoader");
     if (!in_memory_cl_class) {
         LOGE("Failed to find InMemoryDexClassLoader.");
@@ -192,7 +263,6 @@ void VectorModule::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
         return;
     }
 
-    // Store a global reference to our new ClassLoader.
     inject_class_loader_ = env->NewGlobalRef(new_cl.get());
     LOGV("Framework ClassLoader created successfully.");
 }
@@ -203,19 +273,16 @@ void VectorModule::SetupEntryClass(JNIEnv *env) {
         return;
     }
 
-    // Use the obfuscation map from the config to get the real class name.
     const auto &obfs_map = ConfigBridge::GetInstance()->obfuscation_map();
     std::string entry_class_name;
     entry_class_name = obfs_map.at("org.matrix.vector.core.") + "Main";
 
-    // We must find the class through our custom ClassLoader.
     auto entry_class = this->FindClassFromLoader(env, inject_class_loader_, entry_class_name);
     if (!entry_class) {
         LOGE("Failed to find entry class '{}' in the loaded DEX.", entry_class_name.c_str());
         return;
     }
 
-    // Store a global reference to the entry class.
     entry_class_ = lsplant::JNI_NewGlobalRef(env, entry_class);
     LOGV("Framework entry class '{}' located.", entry_class_name.c_str());
 }
@@ -224,32 +291,32 @@ void VectorModule::onLoad(zygisk::Api *api, JNIEnv *env) {
     this->api_ = api;
     this->env_ = env;
 
-    // Create two singlton instances for classes Context and ConfigBridge
     instance_.reset(this);
     ConfigImpl::Init();
     LOGD("Vector Zygisk module loaded");
 }
 
 void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
-    // Reset state for this new process fork.
     should_inject_ = false;
     is_manager_app_ = false;
+    should_invalidate_inline_hooks_ = false;
+    {
+        std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
+        g_art_hooks.clear();
+        g_record_art_hooks = false;
+    }
 
-    // --- Manager App Special Handling ---
-    // We identify our manager app by a special UID and
-    // grant it internet permissions by adding it to the INET group.
     if (args->uid == kHostPackageUid) {
         lsplant::JUTFString nice_name_str(env_, args->nice_name);
         if (nice_name_str.get() == std::string(kManagerPackageName)) {
             LOGI("Manager app detected. Granting internet permissions.");
             is_manager_app_ = true;
 
-            // Add GID_INET to the GID list.
             int original_gids_count = env_->GetArrayLength(args->gids);
             jintArray new_gids = env_->NewIntArray(original_gids_count + 1);
             if (env_->ExceptionCheck()) {
                 LOGE("Failed to create new GID array for manager.");
-                env_->ExceptionClear();  // Clear exception to prevent a crash.
+                env_->ExceptionClear();
                 return;
             }
 
@@ -260,16 +327,6 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
             jint inet_gid = GID_INET;
             env_->SetIntArrayRegion(new_gids, original_gids_count, 1, &inet_gid);
 
-            // The new array is only seen by the native specialization, which calls setgroups().
-            // Once it returns, Zygote#forkAndSpecialize keeps using the array it passed in:
-            //
-            //   NetworkUtils.setAllowNetworkingForProcess(containsInetGid(gids));
-            //
-            // That flag lives in libnetd_client and gates the whole process: without it,
-            // socket() and dns_open_proxy() fail with EPERM no matter which groups we really
-            // belong to. So overwrite the first entry of the original array as well, to make
-            // containsInetGid() see the INET group. Dropping this slot is harmless: the array
-            // has no further use once specialization is done.
             if (original_gids_count > 0) {
                 env_->SetIntArrayRegion(args->gids, 0, 1, &inet_gid);
             }
@@ -281,23 +338,18 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
 
     IPCBridge::GetInstance().Initialize(env_);
 
-    // --- Injection Decision Logic ---
-    // Determine if the current process is a valid target for injection.
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
 
-    // An app without a data directory cannot be a target.
     if (!args->app_data_dir) {
         LOGD("Skipping injection for '{}': no app_data_dir.", nice_name_str.get());
         return;
     }
 
-    // Child Zygotes are specialized zygotes for apps like WebView and are not targets.
     if (args->is_child_zygote && *args->is_child_zygote) {
         LOGD("Skipping injection for '{}': is a child zygote.", nice_name_str.get());
         return;
     }
 
-    // Skip isolated processes, which are heavily sandboxed.
     const uid_t app_id = args->uid % PER_USER_RANGE;
     if ((app_id >= FIRST_ISOLATED_UID && app_id <= LAST_ISOLATED_UID) ||
         (app_id >= FIRST_APP_ZYGOTE_ISOLATED_UID && app_id <= LAST_APP_ZYGOTE_ISOLATED_UID) ||
@@ -307,14 +359,32 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
         return;
     }
 
-    // If we passed all checks, mark this process for injection.
     should_inject_ = true;
     LOGV("Process '{}' (UID: {}) is marked for injection.", nice_name_str.get(), args->uid);
+
+    if (!is_manager_app_ && api_) {
+        std::string proc_name = nice_name_str.get() ? nice_name_str.get() : "";
+        if (!proc_name.empty()) {
+            int companion_fd = api_->connectCompanion();
+            if (companion_fd >= 0) {
+                auto len = static_cast<uint32_t>(proc_name.size());
+                uint8_t matched = 0;
+                if (WriteExact(companion_fd, &len, sizeof(len)) &&
+                    WriteExact(companion_fd, proc_name.data(), len) &&
+                    ReadExact(companion_fd, &matched, sizeof(matched))) {
+                    should_invalidate_inline_hooks_ = (matched != 0);
+                }
+                close(companion_fd);
+            } else {
+                LOGW("Failed to connect to Zygisk companion for '{}'.", proc_name.c_str());
+            }
+        }
+    }
 }
 
 void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     if (!should_inject_) {
-        SetAllowUnload(true);  // Not a target, allow module to be unloaded.
+        SetAllowUnload(true);
         return;
     }
 
@@ -322,21 +392,17 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
         args->nice_name = env_->NewStringUTF(kManagerPackageName);
     }
 
-    // --- Framework Injection ---
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
     LOGD("Asking the daemon about '{}'.", nice_name_str.get());
 
     auto &ipc_bridge = IPCBridge::GetInstance();
     auto binder = ipc_bridge.RequestAppBinder(env_, args->nice_name);
     if (!binder) {
-        // Usually because nothing has it in scope, but the daemon may also not be up yet or have
-        // registered this process already. Only it knows which, and it logs the reason itself.
         LOGD("Not injecting '{}': the daemon has no binder for it.", nice_name_str.get());
         SetAllowUnload(true);
         return;
     }
 
-    // Fetch resources from the manager service.
     auto [dex_fd, dex_size] = ipc_bridge.FetchFrameworkDex(env_, binder.get());
     if (dex_fd < 0) {
         LOGE("Failed to fetch framework DEX for '{}'.", nice_name_str.get());
@@ -351,16 +417,23 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
         PreloadedDex dex(dex_fd, dex_size);
         this->LoadDex(env_, std::move(dex));
     }
-    close(dex_fd);  // The FD is duplicated by mmap, we can close it now.
+    close(dex_fd);
 
-    // Initialize ART hooks via the native library.
+    // Record libart.so inline hooks installed by LSPlant if configured for this app.
+    {
+        std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
+        g_art_hooks.clear();
+        g_record_art_hooks = should_invalidate_inline_hooks_;
+    }
     this->InitArtHooker(env_, init_info_);
-    // Initialize JNI hooks via the native library.
+    {
+        std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
+        g_record_art_hooks = false;
+    }
+
     this->InitHooks(env_);
-    // Find the Java entrypoint.
     this->SetupEntryClass(env_);
 
-    // Hand off control to the Java side of the framework.
     bool entered = this->FindAndCall(
         env_, "forkCommon", "(ZZLjava/lang/String;Ljava/lang/String;Landroid/os/IBinder;)V",
         JNI_FALSE, JNI_FALSE, args->nice_name, args->app_data_dir, binder.get(), is_manager_app_);
@@ -371,17 +444,29 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
         LOGE("Framework entry failed in '{}'; this process runs without Xposed.",
              nice_name_str.get());
     }
-    // Unconditionally: the ART and JNI hooks were installed before the entry ran, and their
-    // trampolines point into this library. Letting it be unloaded now would leave them dangling.
+
+    if (should_invalidate_inline_hooks_) {
+        std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
+        size_t restored = 0;
+        for (auto it = g_art_hooks.rbegin(); it != g_art_hooks.rend(); ++it) {
+            if (UnhookInline(*it) == 0) {
+                ++restored;
+            } else {
+                LOGW("Failed to restore inline hook at {} in '{}'.", *it, nice_name_str.get());
+            }
+        }
+        LOGI("Invalidated {}/{} libart.so inline hooks for '{}'.", restored, g_art_hooks.size(),
+             nice_name_str.get());
+        g_art_hooks.clear();
+    }
+
     SetAllowUnload(false);
 }
 
 void VectorModule::preServerSpecialize(zygisk::ServerSpecializeArgs *args) {
-    // The system server is always a target for injection.
     should_inject_ = true;
     LOGI("System server process detected. Marking for injection.");
 
-    // Initialize our IPC bridge singleton.
     IPCBridge::GetInstance().Initialize(env_);
 }
 
@@ -393,9 +478,6 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
 
     LOGD("Attempting injection into system_server.");
 
-    // --- Device-Specific Workaround ---
-    // Some ZTE devices require argv[0] to be explicitly set to "system_server"
-    // for certain services to function correctly after modification.
     if (__system_property_find("ro.vendor.product.ztename")) {
         LOGV("Applying ZTE-specific workaround: setting argv[0] to system_server.");
         auto process_class = lsplant::ScopedLocalRef(env_, env_->FindClass("android/os/Process"));
@@ -413,28 +495,20 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
         }
     }
 
-    // --- Framework Injection for System Server ---
     auto &ipc_bridge = IPCBridge::GetInstance();
-    // NeoZygisk sets LATE_INJECT when it drove this specialization on a system_server that was
-    // already serving. An implementation that says nothing is caught by the probe: a serving
-    // system_server is what a late load always leaves behind, and what the daemon tests too.
     bool is_late_inject = (args->runtime_flags & RuntimeFlags::LATE_INJECT) != 0 ||
                           ipc_bridge.IsSystemServerRunning(env_);
-    // The real `serial` service is registered by then, and a lookup returning it would be
-    // indistinguishable from a successful rendezvous.
     std::string bridgeServiceName = is_late_inject ? "serial_vector" : "serial";
     auto system_binder = ipc_bridge.RequestSystemServerBinder(env_, bridgeServiceName);
     if (!system_binder) {
         LOGE("Failed to get system server IPC binder. Aborting injection.");
-        SetAllowUnload(true);  // Allow unload on failure.
+        SetAllowUnload(true);
         return;
     }
 
     auto manager_binder =
         ipc_bridge.RequestManagerBinderFromSystemServer(env_, system_binder.get());
 
-    // Use either the direct manager binder if available,
-    // otherwise proxy through the system binder.
     jobject effective_binder = manager_binder ? manager_binder.get() : system_binder.get();
 
     auto [dex_fd, dex_size] = ipc_bridge.FetchFrameworkDex(env_, effective_binder);
@@ -470,7 +544,6 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
     } else {
         LOGE("Framework entry failed in system_server; it runs without Xposed.");
     }
-    // See postAppSpecialize: the hooks outlive a failed entry, so the library must stay.
     SetAllowUnload(false);
 }
 
@@ -479,9 +552,6 @@ void VectorModule::SetAllowUnload(bool unload) {
         LOGD("Allowing Zygisk to unload module library.");
         api_->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
 
-        // Release the pointer from the unique_ptr's control. This prevents the
-        // static unique_ptr's destructor from calling delete on our object, which
-        // would cause a double-free when the Zygisk framework cleans up.
         if (instance_.release() != nullptr) {
             LOGD("Module context singleton released.");
         }
@@ -492,7 +562,5 @@ void VectorModule::SetAllowUnload(bool unload) {
 
 }  // namespace vector::native::module
 
-// =========================================================================================
-// Zygisk Module Registration
-// =========================================================================================
 REGISTER_ZYGISK_MODULE(vector::native::module::VectorModule);
+REGISTER_ZYGISK_COMPANION(vector::native::module::CompanionHandler);
