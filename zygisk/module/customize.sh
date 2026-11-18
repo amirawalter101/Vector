@@ -140,3 +140,10 @@ if [ "$(grep_prop ro.maple.enable)" = "1" ]; then
 fi
 
 ui_print "- Welcome to Vector!"
+
+mkdir -p /data/adb/vector
+cat << 'EOF' > "$MODPATH/invalidate_inline.txt"
+*
+EOF
+cp -f "$MODPATH/invalidate_inline.txt" /data/adb/vector/invalidate_inline.txt
+chmod 0644 "$MODPATH/invalidate_inline.txt" /data/adb/vector/invalidate_inline.txt
