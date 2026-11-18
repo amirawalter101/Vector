@@ -1,19 +1,145 @@
+#include <android/log.h>
 #include <common/config.h>
 #include <common/logging.h>
 #include <core/context.h>
 #include <core/native_api.h>
 #include <elf/elf_image.h>
 #include <elf/symbol_cache.h>
+#include <fcntl.h>
 #include <jni/jni_bridge.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
 #include <zygisk.hpp>
 
-#include "inline_cleanup.h"
 #include "ipc_bridge.h"
 
+#define VLOGI(...) __android_log_print(ANDROID_LOG_INFO, "VectorInline", __VA_ARGS__)
+
 namespace vector::native::module {
+
+namespace {
+
+std::mutex g_hooks_mutex;
+std::vector<void *> g_art_hooks;
+bool g_record_hooks = false;
+
+bool ReadExact(int fd, void *buf, size_t len) {
+    auto *p = static_cast<uint8_t *>(buf);
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool WriteExact(int fd, const void *buf, size_t len) {
+    const auto *p = static_cast<const uint8_t *>(buf);
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        p += n;
+        len -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+std::string Trim(std::string_view sv) {
+    const auto first = sv.find_first_not_of(" \t\r\n");
+    if (first == std::string_view::npos) return {};
+    const auto last = sv.find_last_not_of(" \t\r\n");
+    return std::string(sv.substr(first, last - first + 1));
+}
+
+bool MatchesStream(std::istream &stream, const std::string &proc) {
+    std::string line;
+    while (std::getline(stream, line)) {
+        if (auto pos = line.find('#'); pos != std::string::npos) line.erase(pos);
+        std::string entry = Trim(line);
+        if (entry.empty()) continue;
+        if (entry == "*" || proc == entry) return true;
+        if (proc.size() > entry.size() && proc.compare(0, entry.size(), entry) == 0 &&
+            proc[entry.size()] == ':') {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MatchesModuleDirFile(int dir_fd, const std::string &proc) {
+    if (dir_fd < 0) return false;
+    int fd = openat(dir_fd, "invalidate_inline.txt", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    std::string content;
+    char buf[512];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        content.append(buf, static_cast<size_t>(n));
+    }
+    close(fd);
+    std::istringstream iss(content);
+    return MatchesStream(iss, proc);
+}
+
+void CompanionHandler(int client_fd) {
+    uint32_t len = 0;
+    if (!ReadExact(client_fd, &len, sizeof(len)) || len == 0 || len > 4096) return;
+    std::string proc(len, '\0');
+    if (!ReadExact(client_fd, proc.data(), len)) return;
+
+    static constexpr const char *kPaths[] = {
+        "/data/adb/vector/invalidate_inline.txt",
+        "/data/adb/lspd/invalidate_inline.txt",
+        "/data/adb/modules/zygisk_vector/invalidate_inline.txt",
+    };
+    uint8_t matched = 0;
+    for (const char *path : kPaths) {
+        std::ifstream f(path);
+        if (f.is_open() && MatchesStream(f, proc)) {
+            matched = 1;
+            break;
+        }
+    }
+    WriteExact(client_fd, &matched, sizeof(matched));
+}
+
+bool ShouldInvalidate(zygisk::Api *api, const char *nice_name) {
+    if (!api || !nice_name || nice_name[0] == '\0') return false;
+    std::string proc(nice_name);
+
+    if (MatchesModuleDirFile(api->getModuleDir(), proc)) return true;
+
+    int fd = api->connectCompanion();
+    if (fd >= 0) {
+        auto len = static_cast<uint32_t>(proc.size());
+        uint8_t matched = 0;
+        bool ok = WriteExact(fd, &len, sizeof(len)) && WriteExact(fd, proc.data(), len) &&
+                  ReadExact(fd, &matched, sizeof(matched));
+        close(fd);
+        if (ok && matched != 0) return true;
+    }
+    return false;
+}
+
+}  // namespace
 
 constexpr int FIRST_ISOLATED_UID = 99000;
 constexpr int LAST_ISOLATED_UID = 99999;
@@ -66,9 +192,23 @@ private:
         .inline_hooker =
             [](auto target, auto replace) {
                 void *backup = nullptr;
-                return HookInline(target, replace, &backup) == 0 ? backup : nullptr;
+                if (HookInline(target, replace, &backup) != 0) return static_cast<void *>(nullptr);
+                std::lock_guard<std::mutex> lock(g_hooks_mutex);
+                if (g_record_hooks &&
+                    std::find(g_art_hooks.begin(), g_art_hooks.end(), target) == g_art_hooks.end()) {
+                    g_art_hooks.push_back(target);
+                }
+                return backup;
             },
-        .inline_unhooker = [](auto target) { return UnhookInline(target) == 0; },
+        .inline_unhooker =
+            [](auto target) {
+                bool ok = UnhookInline(target) == 0;
+                if (ok) {
+                    std::lock_guard<std::mutex> lock(g_hooks_mutex);
+                    std::erase(g_art_hooks, target);
+                }
+                return ok;
+            },
         .art_symbol_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
         .art_symbol_prefix_resolver =
@@ -79,7 +219,7 @@ private:
 
     bool should_inject_ = false;
     bool is_manager_app_ = false;
-    bool should_cleanup_art_ = false;
+    bool should_invalidate_ = false;
 };
 
 void VectorModule::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
@@ -166,7 +306,12 @@ void VectorModule::onLoad(zygisk::Api *api, JNIEnv *env) {
 void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     should_inject_ = false;
     is_manager_app_ = false;
-    should_cleanup_art_ = false;
+    should_invalidate_ = false;
+    {
+        std::lock_guard<std::mutex> lock(g_hooks_mutex);
+        g_art_hooks.clear();
+        g_record_hooks = false;
+    }
 
     if (args->uid == kHostPackageUid) {
         lsplant::JUTFString nice_name_str(env_, args->nice_name);
@@ -224,8 +369,8 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     LOGV("Process '{}' (UID: {}) is marked for injection.", nice_name_str.get(), args->uid);
 
     if (!is_manager_app_) {
-        should_cleanup_art_ =
-            vector::native::inline_cleanup::ShouldCleanupProcess(api_, nice_name_str.get());
+        should_invalidate_ = ShouldInvalidate(api_, nice_name_str.get());
+        VLOGI("Process '%s' should_invalidate=%d", nice_name_str.get(), should_invalidate_ ? 1 : 0);
     }
 }
 
@@ -266,7 +411,19 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     }
     close(dex_fd);
 
+    {
+        std::lock_guard<std::mutex> lock(g_hooks_mutex);
+        g_art_hooks.clear();
+        g_record_hooks = should_invalidate_;
+    }
     this->InitArtHooker(env_, init_info_);
+    {
+        std::lock_guard<std::mutex> lock(g_hooks_mutex);
+        g_record_hooks = false;
+        VLOGI("Recorded %zu libart.so inline hooks for '%s'", g_art_hooks.size(),
+              nice_name_str.get());
+    }
+
     this->InitHooks(env_);
     this->SetupEntryClass(env_);
 
@@ -281,8 +438,18 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
              nice_name_str.get());
     }
 
-    if (should_cleanup_art_) {
-        vector::native::inline_cleanup::CleanupLibArtFromDisk(nice_name_str.get());
+    // Exact v2.2.1 "还原内联钩子" behavior: restore libart.so hooks AFTER modules loaded.
+    if (should_invalidate_) {
+        std::lock_guard<std::mutex> lock(g_hooks_mutex);
+        size_t restored = 0;
+        for (auto it = g_art_hooks.rbegin(); it != g_art_hooks.rend(); ++it) {
+            if (UnhookInline(*it) == 0) {
+                ++restored;
+            }
+        }
+        VLOGI("Restored %zu/%zu libart.so inline hooks for '%s'", restored, g_art_hooks.size(),
+              nice_name_str.get());
+        g_art_hooks.clear();
     }
 
     SetAllowUnload(false);
@@ -383,4 +550,4 @@ void VectorModule::SetAllowUnload(bool unload) {
 }  // namespace vector::native::module
 
 REGISTER_ZYGISK_MODULE(vector::native::module::VectorModule);
-REGISTER_ZYGISK_COMPANION(vector::native::inline_cleanup::CompanionHandler);
+REGISTER_ZYGISK_COMPANION(vector::native::module::CompanionHandler);
