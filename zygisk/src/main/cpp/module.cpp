@@ -3,17 +3,21 @@
 #include <common/logging.h>
 #include <core/context.h>
 #include <core/native_api.h>
-#include <dlfcn.h>
+#include <elf.h>
 #include <elf/elf_image.h>
 #include <elf/symbol_cache.h>
 #include <fcntl.h>
 #include <jni/jni_bridge.h>
+#include <sys/mman.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -30,6 +34,14 @@
 namespace vector::native::module {
 
 namespace {
+
+#if defined(__LP64__)
+using Elf_Ehdr = Elf64_Ehdr;
+using Elf_Phdr = Elf64_Phdr;
+#else
+using Elf_Ehdr = Elf32_Ehdr;
+using Elf_Phdr = Elf32_Phdr;
+#endif
 
 std::mutex g_hooks_mutex;
 std::vector<void *> g_art_hooks;
@@ -142,6 +154,98 @@ bool ShouldInvalidate(zygisk::Api *api, const char *nice_name) {
     return false;
 }
 
+// Restores libart.so executable bytes directly from the clean ELF on disk.
+// Uses mprotect + memcpy, matching LSPosed v2.2.1's imports.
+size_t CleanupLibArtFromDisk(const char *proc_name) {
+    std::ifstream maps("/proc/self/maps");
+    if (!maps.is_open()) {
+        VLOGW("Failed to open /proc/self/maps for '%s'", proc_name);
+        return 0;
+    }
+
+    std::string art_path;
+    uintptr_t art_base = 0;
+    bool found = false;
+
+    std::string line;
+    while (std::getline(maps, line)) {
+        uintptr_t start = 0, end = 0, offset = 0;
+        char perms[5] = {};
+        int path_pos = 0;
+        if (sscanf(line.c_str(), "%" SCNxPTR "-%" SCNxPTR " %4s %" SCNxPTR " %*x:%*x %*u %n",
+                   &start, &end, perms, &offset, &path_pos) < 4) {
+            continue;
+        }
+        if (path_pos <= 0 || static_cast<size_t>(path_pos) >= line.size()) continue;
+        std::string path = Trim(std::string_view(line).substr(path_pos));
+        if (path.ends_with("/libart.so") && offset == 0) {
+            art_path = path;
+            art_base = start;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        VLOGW("libart.so mapping not found for '%s'", proc_name);
+        return 0;
+    }
+
+    int fd = open(art_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        VLOGW("Failed to open %s: errno=%d", art_path.c_str(), errno);
+        return 0;
+    }
+
+    Elf_Ehdr ehdr{};
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) {
+        close(fd);
+        return 0;
+    }
+
+    std::vector<Elf_Phdr> phdrs(ehdr.e_phnum);
+    ssize_t ph_bytes = static_cast<ssize_t>(phdrs.size() * sizeof(Elf_Phdr));
+    if (pread(fd, phdrs.data(), ph_bytes, static_cast<off_t>(ehdr.e_phoff)) != ph_bytes) {
+        close(fd);
+        return 0;
+    }
+
+    const size_t page_sz = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    size_t cleaned = 0;
+
+    for (const auto &ph : phdrs) {
+        if (ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0 || ph.p_filesz == 0) continue;
+
+        uintptr_t dest = art_base + ph.p_vaddr;
+        size_t len = static_cast<size_t>(ph.p_filesz);
+        uintptr_t page_start = dest & ~(page_sz - 1);
+        uintptr_t page_end = (dest + len + page_sz - 1) & ~(page_sz - 1);
+        size_t map_len = page_end - page_start;
+
+        std::vector<uint8_t> clean(len);
+        ssize_t rd = pread(fd, clean.data(), len, static_cast<off_t>(ph.p_offset));
+        if (rd <= 0) continue;
+
+        if (mprotect(reinterpret_cast<void *>(page_start), map_len,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            VLOGW("mprotect failed for %" PRIxPTR " errno=%d", page_start, errno);
+            continue;
+        }
+
+        memcpy(reinterpret_cast<void *>(dest), clean.data(), len);
+
+        mprotect(reinterpret_cast<void *>(page_start), map_len, PROT_READ | PROT_EXEC);
+        __builtin___clear_cache(reinterpret_cast<char *>(dest),
+                                reinterpret_cast<char *>(dest + len));
+        ++cleaned;
+    }
+
+    close(fd);
+    VLOGI("Cleaned %zu executable segment(s) of libart.so from disk for '%s'", cleaned,
+          proc_name);
+    return cleaned;
+}
+
 }  // namespace
 
 constexpr int FIRST_ISOLATED_UID = 99000;
@@ -197,33 +301,15 @@ private:
                 void *backup = nullptr;
                 if (HookInline(target, replace, &backup) != 0) return static_cast<void *>(nullptr);
 
-                Dl_info info{};
-                if (dladdr(target, &info)) {
-                    __android_log_print(ANDROID_LOG_INFO, "VectorInline",
-                                        "HOOKED %s+0x%zx %s",
-                                        info.dli_fname ? info.dli_fname : "?",
-                                        (size_t)((uintptr_t)target - (uintptr_t)info.dli_fbase),
-                                        info.dli_sname ? info.dli_sname : "?");
-                } else {
-                    __android_log_print(ANDROID_LOG_INFO, "VectorInline", "HOOKED %p", target);
-                }
-
                 std::lock_guard<std::mutex> lock(g_hooks_mutex);
                 if (g_record_hooks &&
-                    std::find(g_art_hooks.begin(), g_art_hooks.end(), target) == g_art_hooks.end()) {
+                    std::find(g_art_hooks.begin(), g_art_hooks.end(), target) ==
+                        g_art_hooks.end()) {
                     g_art_hooks.push_back(target);
                 }
                 return backup;
             },
-        .inline_unhooker =
-            [](auto target) {
-                bool ok = UnhookInline(target) == 0;
-                if (ok) {
-                    std::lock_guard<std::mutex> lock(g_hooks_mutex);
-                    std::erase(g_art_hooks, target);
-                }
-                return ok;
-            },
+        .inline_unhooker = [](auto target) { return UnhookInline(target) == 0; },
         .art_symbol_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
         .art_symbol_prefix_resolver =
@@ -453,17 +539,9 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
              nice_name_str.get());
     }
 
+    // LSPosed v2.2.1 "还原内联钩子" behavior: restore libart.so from disk after modules load.
     if (should_invalidate_) {
-        std::lock_guard<std::mutex> lock(g_hooks_mutex);
-        size_t restored = 0;
-        for (auto it = g_art_hooks.rbegin(); it != g_art_hooks.rend(); ++it) {
-            if (UnhookInline(*it) == 0) {
-                ++restored;
-            }
-        }
-        VLOGI("Restored %zu/%zu libart.so inline hooks for '%s'", restored, g_art_hooks.size(),
-              nice_name_str.get());
-        g_art_hooks.clear();
+        CleanupLibArtFromDisk(nice_name_str.get());
     }
 
     SetAllowUnload(false);
