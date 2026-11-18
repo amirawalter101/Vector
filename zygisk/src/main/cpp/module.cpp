@@ -3,6 +3,7 @@
 #include <common/logging.h>
 #include <core/context.h>
 #include <core/native_api.h>
+#include <dlfcn.h>
 #include <elf/elf_image.h>
 #include <elf/symbol_cache.h>
 #include <fcntl.h>
@@ -10,6 +11,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <fstream>
@@ -23,6 +25,7 @@
 #include "ipc_bridge.h"
 
 #define VLOGI(...) __android_log_print(ANDROID_LOG_INFO, "VectorInline", __VA_ARGS__)
+#define VLOGW(...) __android_log_print(ANDROID_LOG_WARN, "VectorInline", __VA_ARGS__)
 
 namespace vector::native::module {
 
@@ -193,6 +196,18 @@ private:
             [](auto target, auto replace) {
                 void *backup = nullptr;
                 if (HookInline(target, replace, &backup) != 0) return static_cast<void *>(nullptr);
+
+                Dl_info info{};
+                if (dladdr(target, &info)) {
+                    __android_log_print(ANDROID_LOG_INFO, "VectorInline",
+                                        "HOOKED %s+0x%zx %s",
+                                        info.dli_fname ? info.dli_fname : "?",
+                                        (size_t)((uintptr_t)target - (uintptr_t)info.dli_fbase),
+                                        info.dli_sname ? info.dli_sname : "?");
+                } else {
+                    __android_log_print(ANDROID_LOG_INFO, "VectorInline", "HOOKED %p", target);
+                }
+
                 std::lock_guard<std::mutex> lock(g_hooks_mutex);
                 if (g_record_hooks &&
                     std::find(g_art_hooks.begin(), g_art_hooks.end(), target) == g_art_hooks.end()) {
@@ -438,7 +453,6 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
              nice_name_str.get());
     }
 
-    // Exact v2.2.1 "还原内联钩子" behavior: restore libart.so hooks AFTER modules loaded.
     if (should_invalidate_) {
         std::lock_guard<std::mutex> lock(g_hooks_mutex);
         size_t restored = 0;
