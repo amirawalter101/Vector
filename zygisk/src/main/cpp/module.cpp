@@ -8,128 +8,17 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
-#include <algorithm>
-#include <cerrno>
-#include <cstdint>
-#include <fstream>
-#include <mutex>
-#include <string>
-#include <string_view>
-#include <vector>
 #include <zygisk.hpp>
 
-#include "ipc_bridge.h"
 #include "inline_cleanup.h"
+#include "ipc_bridge.h"
 
 namespace vector::native::module {
 
-namespace {
-
-std::mutex g_art_hooks_mutex;
-std::vector<void *> g_art_hooks;
-bool g_record_art_hooks = false;
-
-bool ReadExact(int fd, void *buf, size_t len) {
-    auto *p = static_cast<uint8_t *>(buf);
-    size_t remaining = len;
-    while (remaining > 0) {
-        ssize_t n = read(fd, p, remaining);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        p += n;
-        remaining -= static_cast<size_t>(n);
-    }
-    return true;
-}
-
-bool WriteExact(int fd, const void *buf, size_t len) {
-    const auto *p = static_cast<const uint8_t *>(buf);
-    size_t remaining = len;
-    while (remaining > 0) {
-        ssize_t n = write(fd, p, remaining);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) return false;
-        p += n;
-        remaining -= static_cast<size_t>(n);
-    }
-    return true;
-}
-
-std::string TrimWhitespace(std::string_view sv) {
-    const auto first = sv.find_first_not_of(" \t\r\n");
-    if (first == std::string_view::npos) return {};
-    const auto last = sv.find_last_not_of(" \t\r\n");
-    return std::string(sv.substr(first, last - first + 1));
-}
-
-bool MatchesProcessInFile(const char *path, const std::string &proc_name) {
-    std::ifstream file(path);
-    if (!file.is_open()) return false;
-
-    std::string raw_line;
-    while (std::getline(file, raw_line)) {
-        auto comment_pos = raw_line.find('#');
-        if (comment_pos != std::string::npos) {
-            raw_line.erase(comment_pos);
-        }
-        std::string entry = TrimWhitespace(raw_line);
-        if (entry.empty()) continue;
-
-        if (entry == "*" || proc_name == entry) {
-            return true;
-        }
-        // Also match child/service processes of the package (e.g. "com.pkg:remote")
-        if (proc_name.size() > entry.size() &&
-            proc_name.compare(0, entry.size(), entry) == 0 &&
-            proc_name[entry.size()] == ':') {
-            return true;
-        }
-    }
-    return false;
-}
-
-}  // namespace
-
-void CompanionHandler(int client_fd) {
-    uint32_t len = 0;
-    if (!ReadExact(client_fd, &len, sizeof(len)) || len == 0 || len > 4096) {
-        return;
-    }
-    std::string proc_name(len, '\0');
-    if (!ReadExact(client_fd, proc_name.data(), len)) {
-        return;
-    }
-
-    static constexpr const char *kConfigPaths[] = {
-        "/data/adb/vector/invalidate_inline.txt",
-        "/data/adb/lspd/invalidate_inline.txt",
-        "/data/adb/modules/zygisk_vector/invalidate_inline.txt",
-    };
-
-    uint8_t matched = 0;
-    for (const char *path : kConfigPaths) {
-        if (MatchesProcessInFile(path, proc_name)) {
-            matched = 1;
-            break;
-        }
-    }
-
-    WriteExact(client_fd, &matched, sizeof(matched));
-}
-
-// --- Process UID Constants ---
 constexpr int FIRST_ISOLATED_UID = 99000;
 constexpr int LAST_ISOLATED_UID = 99999;
-
 constexpr int FIRST_APP_ZYGOTE_ISOLATED_UID = 90000;
 constexpr int LAST_APP_ZYGOTE_ISOLATED_UID = 98999;
-
 constexpr int SHARED_RELRO_UID = 1037;
 constexpr int PER_USER_RANGE = 100000;
 
@@ -146,14 +35,11 @@ using obfuscation_map_t = std::map<std::string, std::string>;
 class ConfigImpl : public ConfigBridge {
 public:
     inline static void Init() { instance_ = std::make_unique<ConfigImpl>(); }
-
     virtual obfuscation_map_t &obfuscation_map() override { return obfuscation_map_; }
-
     virtual void obfuscation_map(obfuscation_map_t m) override { obfuscation_map_ = std::move(m); }
 
 private:
     ConfigImpl() = default;
-
     friend std::unique_ptr<ConfigImpl> std::make_unique<ConfigImpl>();
     obfuscation_map_t obfuscation_map_;
 };
@@ -176,31 +62,13 @@ private:
     zygisk::Api *api_ = nullptr;
     JNIEnv *env_ = nullptr;
 
-    // --- ART Hooker Configuration ---
     const lsplant::InitInfo init_info_{
         .inline_hooker =
             [](auto target, auto replace) {
                 void *backup = nullptr;
-                if (HookInline(target, replace, &backup) == 0) {
-                    std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
-                    if (g_record_art_hooks &&
-                        std::find(g_art_hooks.begin(), g_art_hooks.end(), target) ==
-                            g_art_hooks.end()) {
-                        g_art_hooks.push_back(target);
-                    }
-                    return backup;
-                }
-                return static_cast<void *>(nullptr);
+                return HookInline(target, replace, &backup) == 0 ? backup : nullptr;
             },
-        .inline_unhooker =
-            [](auto target) {
-                bool ok = UnhookInline(target) == 0;
-                if (ok) {
-                    std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
-                    std::erase(g_art_hooks, target);
-                }
-                return ok;
-            },
+        .inline_unhooker = [](auto target) { return UnhookInline(target) == 0; },
         .art_symbol_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
         .art_symbol_prefix_resolver =
@@ -212,7 +80,6 @@ private:
     bool should_inject_ = false;
     bool is_manager_app_ = false;
     bool should_cleanup_art_ = false;
-    bool should_invalidate_inline_hooks_ = false;
 };
 
 void VectorModule::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
@@ -276,8 +143,7 @@ void VectorModule::SetupEntryClass(JNIEnv *env) {
     }
 
     const auto &obfs_map = ConfigBridge::GetInstance()->obfuscation_map();
-    std::string entry_class_name;
-    entry_class_name = obfs_map.at("org.matrix.vector.core.") + "Main";
+    std::string entry_class_name = obfs_map.at("org.matrix.vector.core.") + "Main";
 
     auto entry_class = this->FindClassFromLoader(env, inject_class_loader_, entry_class_name);
     if (!entry_class) {
@@ -292,7 +158,6 @@ void VectorModule::SetupEntryClass(JNIEnv *env) {
 void VectorModule::onLoad(zygisk::Api *api, JNIEnv *env) {
     this->api_ = api;
     this->env_ = env;
-
     instance_.reset(this);
     ConfigImpl::Init();
     LOGD("Vector Zygisk module loaded");
@@ -302,12 +167,6 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     should_inject_ = false;
     is_manager_app_ = false;
     should_cleanup_art_ = false;
-    should_invalidate_inline_hooks_ = false;
-    {
-        std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
-        g_art_hooks.clear();
-        g_record_art_hooks = false;
-    }
 
     if (args->uid == kHostPackageUid) {
         lsplant::JUTFString nice_name_str(env_, args->nice_name);
@@ -340,7 +199,6 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     }
 
     IPCBridge::GetInstance().Initialize(env_);
-
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
 
     if (!args->app_data_dir) {
@@ -364,27 +222,10 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
 
     should_inject_ = true;
     LOGV("Process '{}' (UID: {}) is marked for injection.", nice_name_str.get(), args->uid);
-    if (!is_manager_app_) {
-    should_cleanup_art_ = inline_cleanup::ShouldCleanupProcess(api_, nice_name_str.get());
-}
 
-    if (!is_manager_app_ && api_) {
-        std::string proc_name = nice_name_str.get() ? nice_name_str.get() : "";
-        if (!proc_name.empty()) {
-            int companion_fd = api_->connectCompanion();
-            if (companion_fd >= 0) {
-                auto len = static_cast<uint32_t>(proc_name.size());
-                uint8_t matched = 0;
-                if (WriteExact(companion_fd, &len, sizeof(len)) &&
-                    WriteExact(companion_fd, proc_name.data(), len) &&
-                    ReadExact(companion_fd, &matched, sizeof(matched))) {
-                    should_invalidate_inline_hooks_ = (matched != 0);
-                }
-                close(companion_fd);
-            } else {
-                LOGW("Failed to connect to Zygisk companion for '{}'.", proc_name.c_str());
-            }
-        }
+    if (!is_manager_app_) {
+        should_cleanup_art_ =
+            vector::native::inline_cleanup::ShouldCleanupProcess(api_, nice_name_str.get());
     }
 }
 
@@ -425,18 +266,7 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     }
     close(dex_fd);
 
-    // Record libart.so inline hooks installed by LSPlant if configured for this app.
-    {
-        std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
-        g_art_hooks.clear();
-        g_record_art_hooks = should_invalidate_inline_hooks_;
-    }
     this->InitArtHooker(env_, init_info_);
-    {
-        std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
-        g_record_art_hooks = false;
-    }
-
     this->InitHooks(env_);
     this->SetupEntryClass(env_);
 
@@ -451,31 +281,16 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
              nice_name_str.get());
     }
 
-    if (should_invalidate_inline_hooks_) {
-        std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
-        size_t restored = 0;
-        for (auto it = g_art_hooks.rbegin(); it != g_art_hooks.rend(); ++it) {
-            if (UnhookInline(*it) == 0) {
-                ++restored;
-            } else {
-                LOGW("Failed to restore inline hook at {} in '{}'.", *it, nice_name_str.get());
-            }
-        }
-        LOGI("Invalidated {}/{} libart.so inline hooks for '{}'.", restored, g_art_hooks.size(),
-             nice_name_str.get());
-        g_art_hooks.clear();
+    if (should_cleanup_art_) {
+        vector::native::inline_cleanup::CleanupLibArtFromDisk(nice_name_str.get());
     }
 
-    if (should_cleanup_art_) {
-    inline_cleanup::CleanupLibArtFromDisk(nice_name_str.get());
-}
     SetAllowUnload(false);
 }
 
 void VectorModule::preServerSpecialize(zygisk::ServerSpecializeArgs *args) {
     should_inject_ = true;
     LOGI("System server process detected. Marking for injection.");
-
     IPCBridge::GetInstance().Initialize(env_);
 }
 
@@ -488,7 +303,6 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
     LOGD("Attempting injection into system_server.");
 
     if (__system_property_find("ro.vendor.product.ztename")) {
-        LOGV("Applying ZTE-specific workaround: setting argv[0] to system_server.");
         auto process_class = lsplant::ScopedLocalRef(env_, env_->FindClass("android/os/Process"));
         if (process_class) {
             auto set_argv0_mid =
@@ -499,7 +313,6 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
             }
         }
         if (env_->ExceptionCheck()) {
-            LOGW("Exception occurred during ZTE workaround.");
             env_->ExceptionClear();
         }
     }
@@ -517,7 +330,6 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
 
     auto manager_binder =
         ipc_bridge.RequestManagerBinderFromSystemServer(env_, system_binder.get());
-
     jobject effective_binder = manager_binder ? manager_binder.get() : system_binder.get();
 
     auto [dex_fd, dex_size] = ipc_bridge.FetchFrameworkDex(env_, effective_binder);
@@ -537,7 +349,6 @@ void VectorModule::postServerSpecialize(const zygisk::ServerSpecializeArgs *args
     close(dex_fd);
 
     ipc_bridge.HookBridge(env_);
-
     this->InitArtHooker(env_, init_info_);
     this->InitHooks(env_);
     this->SetupEntryClass(env_);
@@ -573,4 +384,3 @@ void VectorModule::SetAllowUnload(bool unload) {
 
 REGISTER_ZYGISK_MODULE(vector::native::module::VectorModule);
 REGISTER_ZYGISK_COMPANION(vector::native::inline_cleanup::CompanionHandler);
-REGISTER_ZYGISK_COMPANION(vector::native::module::CompanionHandler);
