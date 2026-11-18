@@ -19,6 +19,7 @@
 #include <zygisk.hpp>
 
 #include "ipc_bridge.h"
+#include "inline_cleanup.h"
 
 namespace vector::native::module {
 
@@ -210,6 +211,7 @@ private:
 
     bool should_inject_ = false;
     bool is_manager_app_ = false;
+    bool should_cleanup_art_ = false;
     bool should_invalidate_inline_hooks_ = false;
 };
 
@@ -299,6 +301,7 @@ void VectorModule::onLoad(zygisk::Api *api, JNIEnv *env) {
 void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     should_inject_ = false;
     is_manager_app_ = false;
+    should_cleanup_art_ = false;
     should_invalidate_inline_hooks_ = false;
     {
         std::lock_guard<std::mutex> lock(g_art_hooks_mutex);
@@ -361,6 +364,9 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
 
     should_inject_ = true;
     LOGV("Process '{}' (UID: {}) is marked for injection.", nice_name_str.get(), args->uid);
+    if (!is_manager_app_) {
+    should_cleanup_art_ = inline_cleanup::ShouldCleanupProcess(api_, nice_name_str.get());
+}
 
     if (!is_manager_app_ && api_) {
         std::string proc_name = nice_name_str.get() ? nice_name_str.get() : "";
@@ -460,6 +466,9 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
         g_art_hooks.clear();
     }
 
+    if (should_cleanup_art_) {
+    inline_cleanup::CleanupLibArtFromDisk(nice_name_str.get());
+}
     SetAllowUnload(false);
 }
 
@@ -563,4 +572,5 @@ void VectorModule::SetAllowUnload(bool unload) {
 }  // namespace vector::native::module
 
 REGISTER_ZYGISK_MODULE(vector::native::module::VectorModule);
+REGISTER_ZYGISK_COMPANION(vector::native::inline_cleanup::CompanionHandler);
 REGISTER_ZYGISK_COMPANION(vector::native::module::CompanionHandler);
