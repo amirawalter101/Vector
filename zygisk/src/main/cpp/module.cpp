@@ -531,8 +531,17 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     }
 
     // LSPosed v2.2.1 "还原内联钩子" behavior: restore libart.so from disk after modules load.
-    if (should_invalidate_) {
-        CleanupLibArtFromDisk(nice_name_str.get());
+   if (should_invalidate_) {
+        std::lock_guard<std::mutex> lock(g_hooks_mutex);
+        size_t restored = 0;
+        for (auto it = g_art_hooks.rbegin(); it != g_art_hooks.rend(); ++it) {
+            if (UnhookInline(*it) == 0) {
+                ++restored;
+            }
+        }
+        VLOGI("DobbyDestroy restored %zu/%zu libart.so inline hooks for '%s'",
+              restored, g_art_hooks.size(), nice_name_str.get());
+        g_art_hooks.clear();
     }
 
     SetAllowUnload(false);
