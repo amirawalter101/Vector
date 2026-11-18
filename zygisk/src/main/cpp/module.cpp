@@ -163,8 +163,14 @@ size_t CleanupLibArtFromDisk(const char *proc_name) {
         return 0;
     }
 
+    struct ExecVma {
+        uintptr_t start;
+        uintptr_t end;
+        uintptr_t offset;
+    };
+
     std::string art_path;
-    uintptr_t art_base = 0;
+    std::vector<ExecVma> exec_vmas;
     bool found = false;
 
     std::string line;
@@ -178,16 +184,18 @@ size_t CleanupLibArtFromDisk(const char *proc_name) {
         }
         if (path_pos <= 0 || static_cast<size_t>(path_pos) >= line.size()) continue;
         std::string path = Trim(std::string_view(line).substr(path_pos));
-        if (path.ends_with("/libart.so") && offset == 0) {
-            art_path = path;
-            art_base = start;
-            found = true;
-            break;
-        }
+        if (!path.ends_with("/libart.so")) continue;
+
+        if (art_path.empty()) art_path = path;
+        if (path != art_path) continue;
+        if (perms[2] != 'x') continue;
+
+        exec_vmas.push_back({start, end, offset});
+        found = true;
     }
 
     if (!found) {
-        VLOGW("libart.so mapping not found for '%s'", proc_name);
+        VLOGW("libart.so executable mapping not found for '%s'", proc_name);
         return 0;
     }
 
@@ -197,52 +205,35 @@ size_t CleanupLibArtFromDisk(const char *proc_name) {
         return 0;
     }
 
-    Elf_Ehdr ehdr{};
-    if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) {
-        close(fd);
-        return 0;
-    }
-
-    std::vector<Elf_Phdr> phdrs(ehdr.e_phnum);
-    ssize_t ph_bytes = static_cast<ssize_t>(phdrs.size() * sizeof(Elf_Phdr));
-    if (pread(fd, phdrs.data(), ph_bytes, static_cast<off_t>(ehdr.e_phoff)) != ph_bytes) {
-        close(fd);
-        return 0;
-    }
-
     const size_t page_sz = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     size_t cleaned = 0;
 
-    for (const auto &ph : phdrs) {
-        if (ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0 || ph.p_filesz == 0) continue;
-
-        uintptr_t dest = art_base + ph.p_vaddr;
-        size_t len = static_cast<size_t>(ph.p_filesz);
-        uintptr_t page_start = dest & ~(page_sz - 1);
-        uintptr_t page_end = (dest + len + page_sz - 1) & ~(page_sz - 1);
+    for (const auto &vma : exec_vmas) {
+        uintptr_t page_start = vma.start & ~(page_sz - 1);
+        uintptr_t page_end = (vma.end + page_sz - 1) & ~(page_sz - 1);
         size_t map_len = page_end - page_start;
+        size_t copy_len = vma.end - vma.start;
 
-        std::vector<uint8_t> clean(len);
-        ssize_t rd = pread(fd, clean.data(), len, static_cast<off_t>(ph.p_offset));
+        std::vector<uint8_t> clean(copy_len);
+        ssize_t rd = pread(fd, clean.data(), copy_len, static_cast<off_t>(vma.offset));
         if (rd <= 0) continue;
 
-        if (mprotect(reinterpret_cast<void *>(page_start), map_len,
-                     PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            VLOGW("mprotect failed for %" PRIxPTR " errno=%d", page_start, errno);
+        // Two-step mprotect to avoid SELinux execmod denial in app context.
+        if (mprotect(reinterpret_cast<void *>(page_start), map_len, PROT_READ | PROT_WRITE) != 0) {
+            VLOGW("mprotect RW failed for %" PRIxPTR " errno=%d", page_start, errno);
             continue;
         }
 
-        memcpy(reinterpret_cast<void *>(dest), clean.data(), len);
+        memcpy(reinterpret_cast<void *>(vma.start), clean.data(), copy_len);
 
         mprotect(reinterpret_cast<void *>(page_start), map_len, PROT_READ | PROT_EXEC);
-        __builtin___clear_cache(reinterpret_cast<char *>(dest),
-                                reinterpret_cast<char *>(dest + len));
+        __builtin___clear_cache(reinterpret_cast<char *>(vma.start),
+                                reinterpret_cast<char *>(vma.end));
         ++cleaned;
     }
 
     close(fd);
-    VLOGI("Cleaned %zu executable segment(s) of libart.so from disk for '%s'", cleaned,
-          proc_name);
+    VLOGI("Cleaned %zu executable segment(s) of libart.so from disk for '%s'", cleaned, proc_name);
     return cleaned;
 }
 
