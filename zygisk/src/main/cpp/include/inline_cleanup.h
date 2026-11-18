@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <zygisk.hpp>
 
 #define VLOGI(...) __android_log_print(ANDROID_LOG_INFO, "VectorInline", __VA_ARGS__)
@@ -122,12 +123,8 @@ inline bool ShouldCleanupProcess(zygisk::Api *api, const char *nice_name) {
     if (!api || !nice_name || nice_name[0] == '\0') return false;
     std::string proc(nice_name);
 
-    // 1. Direct check inside module folder (works even if Zygisk companion socket fails)
-    if (MatchesModuleDirFile(api->getModuleDir(), proc)) {
-        return true;
-    }
+    if (MatchesModuleDirFile(api->getModuleDir(), proc)) return true;
 
-    // 2. Fallback check via root companion for /data/adb/vector/invalidate_inline.txt
     int fd = api->connectCompanion();
     if (fd >= 0) {
         auto len = static_cast<uint32_t>(proc.size());
@@ -145,8 +142,8 @@ inline void CleanupLibArtFromDisk(const char *proc_name) {
     if (!maps.is_open()) return;
 
     std::string art_path;
-    uintptr_t first_start = 0;
-    uintptr_t first_offset = 0;
+    uintptr_t ref_start = 0;
+    uintptr_t ref_offset = 0;
     bool found = false;
 
     std::string line;
@@ -162,10 +159,10 @@ inline void CleanupLibArtFromDisk(const char *proc_name) {
         std::string path = Trim(std::string_view(line).substr(path_pos));
         if (path.ends_with("/libart.so")) {
             art_path = path;
-            first_start = start;
-            first_offset = offset;
+            ref_start = start;
+            ref_offset = offset;
             found = true;
-            break;
+            if (offset == 0) break;
         }
     }
     if (!found) {
@@ -196,14 +193,13 @@ inline void CleanupLibArtFromDisk(const char *proc_name) {
     uintptr_t load_bias = 0;
     bool bias_ok = false;
     for (const auto &ph : phdrs) {
-        if (ph.p_type == PT_LOAD && first_offset >= ph.p_offset &&
-            first_offset < ph.p_offset + ph.p_filesz) {
-            load_bias = first_start - (ph.p_vaddr + (first_offset - ph.p_offset));
+        if (ph.p_type == PT_LOAD && ref_offset >= ph.p_offset &&
+            ref_offset < ph.p_offset + ph.p_filesz) {
+            load_bias = ref_start - (ph.p_vaddr + (ref_offset - ph.p_offset));
             bias_ok = true;
             break;
         }
     }
-
     if (!bias_ok) {
         close(fd);
         VLOGW("Failed to compute load_bias for %s", proc_name);
